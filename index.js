@@ -62,11 +62,11 @@ function start() {
     }
   });
 
-  bot.once("spawn", () => {
-    status = "online";
-    delay = 15000;
-    log("joined the server (spawned)");
-  });
+bot.once("login", () => {
+  status = "online";
+  delay = 15000;
+  log("logged in to the server");
+});
 
   bot.on("kicked", (reason) => {
     const text = typeof reason === "string" ? reason : JSON.stringify(reason);
