@@ -65,8 +65,32 @@ function start() {
     }
   });
 
+  // Resource pack handling.
+  // During the configuration phase (proxies like Velocity push the pack here) the server
+  // waits for explicit status replies, so we send them ourselves:
+  // 3 = accepted, 4 = downloaded, 0 = successfully loaded.
+  const packReply = (uuid, result) => {
+    try {
+      bot._client.write("resource_pack_receive", { uuid, result });
+    } catch (e) {
+      log("pack reply failed: " + e.message);
+    }
+  };
+
+  bot._client.on("add_resource_pack", (p) => {
+    if (bot._client.state !== "configuration") return; // play-state packs handled below
+    log(`config-phase pack ${p.url}, replying accepted/loaded`);
+    packReply(p.uuid, 3);
+    setTimeout(() => packReply(p.uuid, 4), 400);
+    setTimeout(() => {
+      packReply(p.uuid, 0);
+      log("sent pack status: successfully loaded");
+    }, 1000);
+  });
+
   bot.on("resourcePack", (url) => {
     log(`resource pack offered (${String(url).slice(0, 80)}), accepting`);
+    if (bot._client.state === "configuration") return; // handled above
     bot.acceptResourcePack();
   });
 
