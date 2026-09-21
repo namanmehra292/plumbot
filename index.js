@@ -1,4 +1,6 @@
 const mineflayer = require("mineflayer");
+const multer = require("multer");
+const { Builder } = require("./builder.js");
 const express = require("express");
 const { z } = require("zod");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
@@ -11,6 +13,7 @@ const PORT = Number(process.env.MC_PORT || 25565);
 const USERNAME = process.env.BOT_USERNAME;
 const PASSWORD = process.env.BOT_PASSWORD;
 const VERSION = process.env.MC_VERSION || false;
+const TPA_TARGET = process.env.TPA_TARGET || "";
 const MCP_SECRET = process.env.MCP_SECRET;
 
 if (!USERNAME || !PASSWORD || !MCP_SECRET) {
@@ -20,6 +23,7 @@ if (!USERNAME || !PASSWORD || !MCP_SECRET) {
 
 // ---------- bot state ----------
 let bot = null;
+const builder = new Builder(log);
 let status = "offline";
 let wantOnline = true;
 let delay = 15000;
@@ -98,6 +102,8 @@ function start() {
     }
   });
 
+  b.once("spawn", () => builder.setBot(b));
+
   const markOnline = (why) => {
     if (joined) return;
     joined = true;
@@ -105,6 +111,12 @@ function start() {
     status = "online";
     delay = 15000;
     log(`in the world (${why})`);
+    if (TPA_TARGET) {
+      setTimeout(() => {
+        b.chat(`/tpa ${TPA_TARGET}`);
+        log(`sent /tpa ${TPA_TARGET}`);
+      }, 4000);
+    }
   };
   b.once("spawn", () => markOnline("spawn"));
   b.once("respawn", () => markOnline("respawn"));
@@ -120,6 +132,7 @@ function start() {
     clearTimeout(watchdog);
     if (bot === b) bot = null;
     status = "offline";
+    builder.onDisconnected();
     if (banned) {
       wantOnline = false;
       log("looks like a ban, not reconnecting");
@@ -200,6 +213,79 @@ function buildServer() {
     return text("Joining the server.");
   });
 
+  s.tool(
+    "scan_chests",
+    "Walk to nearby chests and remember what is inside each one, for building from a schematic",
+    { radius: z.number().int().min(1).max(48).optional() },
+    async ({ radius }) => {
+      if (!builder.bot) return text("Bot is not in the world.");
+      const n = await builder.scanChests(radius || 16);
+      const totals = builder.chestSummary();
+      return text({ chestsScanned: n, totals: Object.fromEntries(totals) });
+    }
+  );
+
+  s.tool("chest_memory", "Show all chests the bot has scanned and their contents", {}, async () => {
+    if (!builder.bot) return text("Bot is not in the world.");
+    const out = [...builder.chests.values()].map((c) => ({ pos: c.pos, items: Object.fromEntries(c.items) }));
+    return text(out);
+  });
+
+  s.tool(
+    "build_preview",
+    "Show what the currently loaded schematic needs, and how that compares to remembered chest contents",
+    {},
+    async () => {
+      if (!builder || !builder.job) return text("No schematic loaded yet. Upload one to /schematic/<secret> first.");
+      const missing = builder.diffAgainstChests();
+      return text({
+        totalBlocks: builder.job.blocks.length,
+        needed: Object.fromEntries([...builder.job.needed]),
+        missingFromChests: missing,
+      });
+    }
+  );
+
+  s.tool(
+    "build_start",
+    "Start (or resume) building the loaded schematic using remembered chests for materials",
+    {
+      offsetX: z.number().int().optional(),
+      offsetY: z.number().int().optional(),
+      offsetZ: z.number().int().optional(),
+    },
+    async ({ offsetX, offsetY, offsetZ }) => {
+      if (!builder || !builder.job) return text("No schematic loaded yet.");
+      builder
+        .runBuild({ x: offsetX || 0, y: offsetY || 0, z: offsetZ || 0 })
+        .then((r) => log(`build finished: ${JSON.stringify(r)}`))
+        .catch((e) => log("build error: " + e.message));
+      return text("Build started in the background. Use build_status to check progress.");
+    }
+  );
+
+  s.tool("build_status", "Check progress of the current build job", {}, async () => {
+    if (!builder.bot) return text("Bot is not in the world.");
+    return text(builder.status());
+  });
+
+  s.tool("build_stop", "Pause the current build job after the block in progress finishes", {}, async () => {
+    if (!builder.bot) return text("Bot is not in the world.");
+    builder.stopBuild();
+    return text("Stopping after the current block.");
+  });
+
+  s.tool(
+    "build_cleanup",
+    "Remove any temporary scaffold blocks left over from an interrupted build",
+    {},
+    async () => {
+      if (!builder.bot) return text("Bot is not in the world.");
+      await builder.cleanupScaffold();
+      return text("Scaffold cleanup done.");
+    }
+  );
+
   return s;
 }
 
@@ -209,6 +295,20 @@ app.use(express.json());
 // Simple status page that does not expose chat or credentials.
 app.get("/", (req, res) => {
   res.type("text/plain").send(`status: ${status}\n`);
+});
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+app.post(`/schematic/${MCP_SECRET}`, upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "no file uploaded (field name: file)" });
+    if (!builder.bot) return res.status(409).json({ error: "bot is not in the world yet" });
+    const info = await builder.loadSchematic(req.file.buffer);
+    log(`schematic loaded: ${info.blockCount} blocks`);
+    res.json(info);
+  } catch (e) {
+    log("schematic load error: " + e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 const route = `/mcp/${MCP_SECRET}`;
@@ -232,4 +332,18 @@ app.get(route, notAllowed);
 app.delete(route, notAllowed);
 
 app.listen(process.env.PORT || 3000, () => log("HTTP server listening"));
+
+// Render's free plan sleeps a web service after ~15 min with no inbound
+// HTTP traffic. Self-ping every 4 minutes so it never goes quiet, as a
+// backup independent of any external cron/uptime service.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || "";
+if (SELF_URL) {
+  const client = SELF_URL.startsWith("https") ? require("https") : require("http");
+  setInterval(() => {
+    client.get(SELF_URL, (res) => res.resume()).on("error", (e) => log("self-ping failed: " + e.message));
+  }, 4 * 60 * 1000);
+  log(`self-ping enabled for ${SELF_URL}`);
+} else {
+  log("self-ping disabled (no RENDER_EXTERNAL_URL/SELF_URL set)");
+}
 start();
